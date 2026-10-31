@@ -1,0 +1,244 @@
+# =============================================================================
+# Genera los ejecutables de PyOECF (Windows, macOS y Linux) con
+# deploy/pyinstaller/PyOECF.spec
+#
+# - Automático, al subir Remoto.sh la rama de despliegue: crea una release
+#   con el nombre de VERSION y le adjunta los ejecutables. Si esa versión ya
+#   está publicada, se PARA: las versiones nunca se sobrescriben.
+#   Las versiones 0.x (alfa/beta) se marcan como "pre-release".
+#   Si un sistema falla (p. ej., GitHub no da máquina Mac), la release se
+#   crea con los demás; al relanzarlo ("Re-run failed jobs"), su paquete
+#   se añade a esa release, sin tocar los que ya tiene.
+#
+# - A mano (pestaña Actions → "Publicar ejecutables" → Run workflow): SOLO
+#   genera los ejecutables, sin release. Se descargan desde la propia página
+#   de la ejecución. Sirve para probar sin gastar un número de versión.
+# =============================================================================
+
+name: Publicar ejecutables
+
+on:
+  push:
+    # --- OJO: mismo valor que RAMA_DESTINO en rec/scripts/remoto.conf
+    branches: [deploy]
+  workflow_dispatch:
+
+permissions:
+  # --- Crear la release y su etiqueta
+  contents: write
+
+env:
+  # --- OJO: mismo nombre que K.NOMBRE en src/kernel/constantes.py
+  NOMBRE: "PyOECF"
+  # --- OJO: misma versión que en INSTALACION.md
+  PYTHON: "3.14"
+  # --- OJO: misma versión que en DESARROLLO de rec/requirements/requirements.conf
+  #     (requirements.conf no llega a la rama de despliegue)
+  PYINSTALLER: "pyinstaller~=6.22"
+  # --- Paquete que se instala en Python puro (sin .pyd) en Windows
+  FONTTOOLS: "fonttools"
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Leer VERSION y comprobar que no está ya publicada
+  # ---------------------------------------------------------------------------
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.leer.outputs.version }}
+      previa: ${{ steps.leer.outputs.previa }}
+
+    steps:
+      - name: Descargar el repo
+        uses: actions/checkout@v7
+
+      - name: Leer VERSION
+        id: leer
+        shell: bash
+        run: |
+          v="$(tr -d '[:space:]' < VERSION)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          # --- 0.x = alfa/beta → pre-release
+          if [[ "$v" == 0.* ]]; then previa=true; else previa=false; fi
+          echo "previa=$previa" >> "$GITHUB_OUTPUT"
+          echo "Versión: $v (previa: $previa)"
+
+      - name: Comprobar que la versión no está publicada
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ steps.leer.outputs.version }}"
+          if gh release view "$v" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::La versión $v ya está publicada. Sube VERSION antes de desplegar."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Generar el ejecutable en cada sistema (PyInstaller no genera para otro)
+  # ---------------------------------------------------------------------------
+  construir:
+    needs: version
+    strategy:
+      # --- Si falla uno, los demás siguen: así se ve qué sistema falla
+      fail-fast: false
+      matrix:
+        include:
+          - maquina: windows-latest
+            sistema: windows
+          - maquina: macos-latest
+            sistema: macos
+          # --- Fija, no "latest": el ejecutable solo funciona en sistemas
+          #     iguales o más nuevos que la máquina que lo genera
+          - maquina: ubuntu-24.04
+            sistema: linux
+    runs-on: ${{ matrix.maquina }}
+
+    steps:
+      - name: Descargar el repo
+        uses: actions/checkout@v7
+
+      - name: Instalar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON }}
+
+      - name: Instalar dependencias
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt "$PYINSTALLER"
+
+      # --- Solo Windows: se descarga el código fuente de PyInstaller y se
+      #     compila su bootloader (con el MSVC de la máquina) en vez de usar
+      #     el precompilado, que los antivirus ya conocen. pip no lo compila
+      #     solo: hay que ejecutar waf. Se imprime el SHA-256 de runw.exe
+      #     antes y después: si son iguales, no se recompiló
+      - name: Recompilar el bootloader de PyInstaller
+        if: matrix.sistema == 'windows'
+        shell: bash
+        run: |
+          pip download --no-deps --no-binary :all: --dest fuente "$PYINSTALLER"
+          tar -xzf fuente/pyinstaller-*.tar.gz -C fuente
+          origen=(fuente/pyinstaller-*/)
+          runw="${origen[0]}PyInstaller/bootloader/Windows-64bit-intel/runw.exe"
+          sha256sum "$runw" || true
+          (cd "${origen[0]}bootloader" && python waf all)
+          sha256sum "$runw"
+          pip install --force-reinstall --no-deps "${origen[0]}"
+
+      # --- Solo Windows: Smart App Control bloquea los .pyd de fontTools
+      #     (p. ej. varLib\iup), compilados con Cython y sin reputación. Se
+      #     instala en Python puro y se comprueba que no queda ninguno
+      - name: fontTools en Python puro
+        if: matrix.sistema == 'windows'
+        shell: bash
+        run: pip install --no-binary "$FONTTOOLS" --force-reinstall --no-deps "$FONTTOOLS"
+
+      - name: Verificar que fontTools no tiene .pyd
+        if: matrix.sistema == 'windows'
+        shell: pwsh
+        run: |
+          $sp = python -c "import fontTools,os;print(os.path.dirname(fontTools.__file__))"
+          $pyd = Get-ChildItem $sp -Recurse -Filter *.pyd
+          if ($pyd) { $pyd | ForEach-Object { Write-Error $_.FullName }; exit 1 }
+
+      - name: Generar el ejecutable
+        shell: bash
+        run: pyinstaller --noconfirm deploy/pyinstaller/PyOECF.spec
+
+      - name: Empaquetar
+        shell: bash
+        run: |
+          paquete="$NOMBRE-${{ needs.version.outputs.version }}-${{ matrix.sistema }}"
+          mkdir paquetes
+          case "${{ matrix.sistema }}" in
+            # --- Un único archivo (portable): se publica el .exe tal cual
+            windows) cp "dist/$NOMBRE.exe" "paquetes/$paquete.exe" ;;
+            # --- ditto conserva la estructura y los permisos de la .app
+            macos)   ditto -c -k --keepParent "dist/$NOMBRE.app" "paquetes/$paquete.zip" ;;
+            # --- tar conserva el permiso de ejecución
+            linux)   tar -czf "paquetes/$paquete.tar.gz" -C dist "$NOMBRE" ;;
+          esac
+          ls -la paquetes
+
+      - name: Guardar el paquete
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.sistema }}
+          path: paquetes/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Crear la release con los paquetes que haya (solo en el automático), o
+  # completarla con los que le falten si ya existe (un sistema relanzado)
+  # ---------------------------------------------------------------------------
+  publicar:
+    needs: [version, construir]
+    # --- También si falla algún sistema: se publican los demás
+    if: github.event_name == 'push' && !cancelled() && needs.version.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Reunir los paquetes
+        uses: actions/download-artifact@v8
+        with:
+          path: paquetes
+          merge-multiple: true
+
+      - name: Crear la release o completarla
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ needs.version.outputs.version }}"
+          shopt -s nullglob
+          paquetes=(paquetes/*)
+          if (( ${#paquetes[@]} == 0 )); then
+            echo "::error::No se generó ningún paquete."
+            exit 1
+          fi
+
+          # --- Suma SHA-256 de cada paquete, con su nombre sin carpeta
+          sumas() {
+            local p
+            for p in "$@"; do
+              (cd "$(dirname "$p")" && sha256sum "$(basename "$p")")
+            done
+          }
+
+          # --- Ya existe: solo los paquetes que le faltan (nunca se
+          #     sobrescribe uno que ya tenga); sus sumas se añaden a las
+          #     que ya tiene SHA256SUMS.txt
+          if gh release view "$v" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            ya="$(gh release view "$v" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')"
+            nuevos=()
+            for p in "${paquetes[@]}"; do
+              grep -qxF "$(basename "$p")" <<< "$ya" || nuevos+=("$p")
+            done
+            if (( ${#nuevos[@]} )); then
+              mkdir previo
+              gh release download "$v" --repo "$GITHUB_REPOSITORY" \
+                --pattern SHA256SUMS.txt --dir previo || true
+              { cat previo/SHA256SUMS.txt 2> /dev/null; sumas "${nuevos[@]}"; } \
+                > SHA256SUMS.txt
+              gh release upload "$v" "${nuevos[@]}" SHA256SUMS.txt \
+                --clobber --repo "$GITHUB_REPOSITORY"
+            fi
+            exit 0
+          fi
+
+          sumas "${paquetes[@]}" > SHA256SUMS.txt
+
+          opciones=()
+          if [[ "${{ needs.version.outputs.previa }}" == "true" ]]; then
+            opciones+=(--prerelease)
+          fi
+          gh release create "$v" "${paquetes[@]}" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$NOMBRE $v" \
+            --notes "Instrucciones: ver INSTALACION.md" \
+            "${opciones[@]}"
